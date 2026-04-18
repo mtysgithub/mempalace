@@ -213,28 +213,39 @@ def test_base_collection_update_default_validates_list_lengths():
 
 
 def test_chroma_cache_invalidates_when_db_file_missing(tmp_path):
-    """A palace rebuild that removes chroma.sqlite3 must drop the stale cache."""
+    """A palace rebuild that removes chroma.sqlite3 must drop the stale cache.
+
+    Primes backend._clients/_freshness directly with a sentinel rather than
+    opening a real ``PersistentClient``: on Windows the sqlite file handle
+    would still be live and ``Path.unlink`` would raise ``PermissionError``,
+    making the test unable to exercise the branch we care about. The decision
+    logic under test is pure (no chromadb calls before the branch), so a
+    sentinel is sufficient.
+    """
     backend = ChromaBackend()
     palace_path = tmp_path / "palace"
-    backend.get_collection(
-        palace=PalaceRef(id=str(palace_path), local_path=str(palace_path)),
-        collection_name="mempalace_drawers",
-        create=True,
-    )
-    assert str(palace_path) in backend._clients
-    prior_client = backend._clients[str(palace_path)]
-    prior_freshness = backend._freshness[str(palace_path)]
-    assert prior_freshness != (0, 0.0)  # DB file exists after get_or_create_collection
+    palace_path.mkdir()
+    db_file = palace_path / "chroma.sqlite3"
+    db_file.write_bytes(b"")  # any file is enough for _db_stat to see it
+    st = db_file.stat()
 
-    # Remove chroma.sqlite3 to simulate a rebuild mid-flight. The stale cache
-    # must not be silently reused — the in-memory HNSW index would be wrong.
-    (palace_path / "chroma.sqlite3").unlink()
+    sentinel = object()
+    backend._clients[str(palace_path)] = sentinel
+    backend._freshness[str(palace_path)] = (st.st_ino, st.st_mtime)
 
+    # Simulate a rebuild mid-flight: chroma.sqlite3 goes away. Safe to unlink
+    # because nothing in this test is holding an OS handle on the file.
+    db_file.unlink()
+
+    prior_freshness = (st.st_ino, st.st_mtime)
     new_client = backend._client(str(palace_path))
-    # New client object (cache was replaced, not reused) and freshness was reset
-    # to (0, 0.0) to reflect "no DB on disk yet" state.
-    assert new_client is not prior_client
-    assert backend._freshness[str(palace_path)] == (0, 0.0)
+    # Cache was replaced (not the sentinel) and freshness reflects the post-
+    # rebuild stat (chromadb re-creates chroma.sqlite3 during PersistentClient
+    # construction; _client re-stats after the constructor so freshness is
+    # not frozen at the pre-rebuild value). The stale cached sentinel would
+    # have served wrong data if returned.
+    assert new_client is not sentinel
+    assert backend._freshness[str(palace_path)] != prior_freshness
 
 
 def test_chroma_cache_picks_up_db_created_after_first_open(tmp_path):
