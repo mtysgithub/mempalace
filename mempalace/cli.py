@@ -156,6 +156,107 @@ def cmd_init(args):
     # Pass 3: protect git repos from accidentally committing per-project files
     _ensure_mempalace_files_gitignored(args.dir)
 
+    # Pass 4: offer to run mine immediately. The directory just had its
+    # rooms + entities set up, so 99% of users will mine next anyway —
+    # asking here removes the "remember to type the next command" friction.
+    # `--auto-mine` skips the prompt and mines automatically; `--yes` is
+    # SCOPED to entity auto-accept and does NOT imply mining.
+    _maybe_run_mine_after_init(args, cfg)
+
+
+def _format_size_mb(num_bytes: int) -> str:
+    """Render a byte count as a human-readable size for the mine estimate.
+
+    < 1 MB rounds up to ``<1 MB`` so users never see a misleading ``0 MB``
+    on small projects. Otherwise reports an integer megabyte count.
+    """
+    if num_bytes <= 0:
+        return "<1 MB"
+    mb = num_bytes / (1024 * 1024)
+    if mb < 1:
+        return "<1 MB"
+    return f"{mb:.0f} MB"
+
+
+def _maybe_run_mine_after_init(args, cfg) -> None:
+    """Prompt the user to mine the directory just initialised, or auto-mine
+    when ``--auto-mine`` was passed. Extracted so the prompt path is
+    unit-testable.
+
+    Behaviour matrix:
+
+    - default (no flags) — prompt, default Yes, mine in-process if accepted
+    - ``--yes`` — entity auto-accept only; STILL prompts for the mine step
+    - ``--auto-mine`` — skip the mine prompt and mine directly
+    - ``--yes --auto-mine`` — fully non-interactive
+
+    Mine errors are surfaced (not swallowed): a failing mine exits with a
+    non-zero status via :func:`sys.exit` so downstream scripts can see it.
+    The pre-scan that produces the file-count estimate is reused as the
+    mine input so we never walk the corpus twice.
+    """
+    from .miner import mine, scan_project
+
+    project_dir = args.dir
+    auto_mine = bool(getattr(args, "auto_mine", False))
+
+    # Single corpus walk: this scan feeds BOTH the "what would be mined"
+    # estimate the user sees in the prompt AND the file list mine() will
+    # process. We pass the result into mine() via the `files` kwarg so it
+    # doesn't re-walk the tree.
+    try:
+        scanned_files = scan_project(project_dir)
+        file_count = len(scanned_files)
+        total_bytes = 0
+        for fp in scanned_files:
+            try:
+                total_bytes += fp.stat().st_size
+            except OSError:
+                # Skip files that vanished between scan and stat — mine()
+                # will skip them too.
+                continue
+        size_str = _format_size_mb(total_bytes)
+    except Exception:
+        scanned_files = None
+        file_count = None
+        size_str = None
+
+    # Show the scope estimate BEFORE the prompt so the user knows what
+    # they are agreeing to. On a real corpus mine takes minutes; hitting
+    # Enter on a default-Y prompt with no size cue is a footgun.
+    if isinstance(file_count, int):
+        if size_str:
+            print(f"  ~{file_count} files (~{size_str}) would be mined into this palace.\n")
+        else:
+            print(f"  ~{file_count} files would be mined into this palace.\n")
+
+    if not auto_mine:
+        try:
+            answer = input("  Mine this directory now? [Y/n] ").strip().lower()
+        except EOFError:
+            # Non-interactive stdin (e.g. piped) — treat like decline so
+            # we don't block. User can re-run with --auto-mine to opt in.
+            answer = "n"
+        if answer not in ("", "y", "yes"):
+            print(f"\n  Skipped. Run `mempalace mine {shlex.quote(project_dir)}` when ready.")
+            return
+
+    palace_path = cfg.palace_path
+    try:
+        mine(
+            project_dir=project_dir,
+            palace_path=palace_path,
+            files=scanned_files,
+        )
+    except KeyboardInterrupt:
+        # mine() handles its own SIGINT summary + sys.exit(130); re-raise
+        # any KeyboardInterrupt that escapes (shouldn't happen) so the
+        # shell still sees a clean interrupt rather than a swallowed one.
+        raise
+    except Exception as e:
+        print(f"\n  ERROR: mine failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
 
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
@@ -584,6 +685,14 @@ def main():
         "--yes",
         action="store_true",
         help="Auto-accept all detected entities (non-interactive)",
+    )
+    p_init.add_argument(
+        "--auto-mine",
+        action="store_true",
+        help=(
+            "Skip the post-init mine prompt and run mine automatically. "
+            "Combine with --yes for a fully non-interactive setup."
+        ),
     )
     p_init.add_argument(
         "--lang",
